@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Exemplo AWS da proposta com Model Serving (claim-check): o payload vai para o S3 uma vez e só o
+  ponteiro trafega. API Gateway (IAM) → Lambda de entrada → SQS → Lambda de inferência → Model Serving
+  {"file_path"} → response_dbx.json no S3 → SNS → fila inbox (no lugar do response router).
+  Inclui uma Lambda que simula o Credit Engine. Em produção, adapte as Lambdas e o bucket existentes.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: lp-serving
+    Description: Prefixo dos nomes dos recursos
+  DatabricksSecretId:
+    Type: String
+    Default: mlops-large-payload-modelserving/databricks-client
+    Description: Secret do Secrets Manager com o OAuth do service principal (scripts/setup_identities.py)
+  EndpointName:
+    Type: String
+    Default: large-payload-scoring-dev
+    Description: Endpoint de Model Serving chamado pela Lambda de inferência
+  VolumeRoot:
+    Type: String
+    Description: Caminho do Volume EXTERNAL, ex. /Volumes/<catálogo>/<schema>/payloads
+  S3Prefix:
+    Type: String
+    Default: payloads/
+    Description: Prefixo do bucket usado pelo Volume EXTERNAL
+
+Resources:
+  # ---------- Bucket + perna de resposta (S3 → SNS → inbox) ----------
+  DecisionsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Prefix}-decisions
+
+  DecisionsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref DecisionsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PermiteNotificacoesDoBucket
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref DecisionsTopic
+            Condition:
+              ArnLike: { "aws:SourceArn": !Sub "arn:aws:s3:::${Prefix}-payloads-${AWS::AccountId}" }
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  PayloadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: DecisionsTopicPolicy
+    Properties:
+      BucketName: !Sub ${Prefix}-payloads-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:  # retenção do exemplo; defina a política real com risco/compliance
+        Rules:
+          - Id: expira-payloads-de-teste
+            Status: Enabled
+            Prefix: !Ref S3Prefix
+            ExpirationInDays: 30
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Topic: !Ref DecisionsTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: !Ref S3Prefix }
+                  - { Name: suffix, Value: response_dbx.json }
+
+  CreditEngineInbox:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Prefix}-credit-engine-inbox
+      MessageRetentionPeriod: 3600
+      VisibilityTimeout: 30
+
+  CreditEngineInboxPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref CreditEngineInbox]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt CreditEngineInbox.Arn
+            Condition:
+              ArnEquals: { "aws:SourceArn": !Ref DecisionsTopic }
+
+  InboxSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref DecisionsTopic
+      Endpoint: !GetAtt CreditEngineInbox.Arn
+      RawMessageDelivery: true
+
+  # ---------- Entrada: API Gateway → Lambda de entrada → SQS (só o ponteiro) ----------
+  RequestsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Prefix}-credit-requests-dlq
+      MessageRetentionPeriod: 1209600
+
+  RequestsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Prefix}-credit-requests
+      VisibilityTimeout: 1800  # 6x o timeout da Lambda de inferência
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RequestsDLQ.Arn
+        maxReceiveCount: 3
+
+  IngressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-ingress-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ingress
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${Prefix}-payloads-${AWS::AccountId}/${S3Prefix}*"
+              - Effect: Allow
+                Action: s3:ListBucket  # HeadObject responde 404 (e não 403) para arquivo ausente
+                Resource: !Sub "arn:aws:s3:::${Prefix}-payloads-${AWS::AccountId}"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt RequestsQueue.Arn
+
+  IngressFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Prefix}-ingress
+      Description: Claim-check — URL pré-assinada para o upload e 202 com o ponteiro na fila
+      Runtime: python3.12
+      Handler: ingress_lambda.handler
+      Code: ../build/lambda/ingress
+      MemorySize: 1024
+      Timeout: 30
+      Role: !GetAtt IngressRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref PayloadBucket
+          QUEUE_URL: !Ref RequestsQueue
+          S3_PREFIX: !Ref S3Prefix
+          VOLUME_ROOT: !Ref VolumeRoot
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${Prefix}-credit-decision
+      ProtocolType: HTTP
+
+  IngressIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IngressFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  UploadsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /uploads
+      AuthorizationType: AWS_IAM
+      Target: !Sub integrations/${IngressIntegration}
+
+  CreditDecisionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /credit-decision
+      AuthorizationType: AWS_IAM
+      Target: !Sub integrations/${IngressIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  IngressInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngressFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+  # ---------- Inferência: SQS → Lambda → Model Serving → response_dbx.json ----------
+  InferenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-inference-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: inference
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DatabricksSecretId}-*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${Prefix}-payloads-${AWS::AccountId}/${S3Prefix}*"
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt RequestsQueue.Arn
+
+  InferenceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Prefix}-inference
+      Description: Chama o Model Serving com {"file_path"} e grava response_dbx.json
+      Runtime: python3.12
+      Handler: inference_lambda.handler
+      Code: ../build/lambda/inference
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt InferenceRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref PayloadBucket
+          DATABRICKS_SECRET_ID: !Ref DatabricksSecretId
+          ENDPOINT_NAME: !Ref EndpointName
+          S3_PREFIX: !Ref S3Prefix
+          VOLUME_ROOT: !Ref VolumeRoot
+
+  InferenceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RequestsQueue.Arn
+      FunctionName: !Ref InferenceFunction
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ---------- Simulador do Credit Engine (só para teste) ----------
+  SimulatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-credit-engine-sim-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: credit-engine-sim
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${Prefix}-payloads-${AWS::AccountId}/${S3Prefix}*"
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt CreditEngineInbox.Arn
+
+  SimulatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Prefix}-credit-engine-sim
+      Description: Simula o Credit Engine — upload no S3 + POST pequeno, e espera a decisão pelo SNS
+      Runtime: python3.12
+      Handler: credit_engine_sim.handler
+      Code: ../build/lambda/credit_engine_sim
+      MemorySize: 2048
+      Timeout: 300
+      Role: !GetAtt SimulatorRole.Arn
+      Environment:
+        Variables:
+          API_URL: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+          BUCKET: !Ref PayloadBucket
+          INBOX_URL: !Ref CreditEngineInbox
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  BucketName:
+    Value: !Ref PayloadBucket
+  RequestsQueueUrl:
+    Value: !Ref RequestsQueue
+  SimulatorFunctionName:
+    Value: !Ref SimulatorFunction

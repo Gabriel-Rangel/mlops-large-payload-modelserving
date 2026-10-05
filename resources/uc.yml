@@ -1,0 +1,20 @@
+# Objetos do Unity Catalog criados pelo bundle.
+resources:
+  schemas:
+    project:
+      name: ${var.schema}
+      catalog_name: ${var.catalog}
+      comment: Modelo, Volume de payloads e inference tables do score de payloads grandes.
+
+  volumes:
+    # EXTERNAL: o Volume é um prefixo do bucket S3 que o lado AWS já usa, então
+    #   s3://<bucket>/payloads/dt=.../<id>/request.json  ==  /Volumes/<catálogo>/<schema>/payloads/dt=.../<id>/request.json
+    # A Lambda grava no S3 e manda ao endpoint só o caminho /Volumes/...
+    # Pré-requisito: external location no bucket (scripts/setup_uc_external_volume.py).
+    payloads:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.project.name}
+      name: ${var.payload_volume}
+      volume_type: ${var.payload_volume_type}
+      storage_location: ${var.payload_s3_url}
+      comment: request.json (corpo original) e response_dbx.json (decisão) por request.

@@ -1,0 +1,75 @@
+# Databricks Asset Bundle — score de payloads grandes (até ~29 MB) com Model Serving.
+#
+#   Credit Engine ──PUT 29 MB──► S3 (Volume EXTERNAL)      ──POST pequeno──► API Gateway → SQS → Lambda
+#   Lambda ──{"file_path": "/Volumes/.../request.json"}──► Model Serving (lê o arquivo pela Files API)
+#   Lambda ──► response_dbx.json no S3 ──► SNS ──► response router
+#
+# Ordem de implantação: ver README.md.
+
+bundle:
+  name: mlops-large-payload-modelserving
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Catálogo do Unity Catalog do ambiente
+  schema:
+    description: Schema do projeto (modelo, Volume, inference tables)
+    default: large_payload_modelserving
+  model_name:
+    description: Nome do modelo registrado no Unity Catalog
+    default: large_payload_scorer
+  endpoint_name:
+    description: Nome do endpoint de Model Serving
+    default: large-payload-scoring
+  experiment_path:
+    description: Experimento MLflow do treino
+    default: /Shared/${bundle.name}/${bundle.target}
+  serving_workload_size:
+    description: Tamanho do endpoint (Small | Medium | Large)
+    default: Small
+  enable_scale_to_zero:
+    description: Scale-to-zero do endpoint. Em produção, "false" (o cold start leva minutos)
+    default: "false"
+  payload_volume:
+    description: Volume com request.json / response_dbx.json
+    default: payloads
+  payload_volume_type:
+    description: EXTERNAL (bucket S3 do cliente; precisa de external location) ou MANAGED (storage do workspace)
+    default: EXTERNAL
+  payload_s3_url:
+    description: Local S3 do Volume EXTERNAL, ex. s3://<bucket>/payloads/ (vazio se MANAGED)
+    default: ""
+  secret_scope:
+    description: Secret scope com o OAuth dos service principals
+    default: mlops-large-payload-modelserving
+  client_sp_app_id:
+    description: Application ID do service principal que chama o endpoint (Lambda de inferência)
+    lookup:
+      service_principal: credit-engine-client
+  serving_sp_app_id:
+    description: Application ID do service principal que o endpoint usa para ler o Volume
+    lookup:
+      service_principal: model-serving-volume-reader
+
+targets:
+  dev:
+    default: true
+    # Sem `mode: development` de propósito: esse modo prefixa o schema com o nome do usuário,
+    # e o caminho do Volume faz parte do contrato com o lado AWS.
+    variables:
+      catalog: <catalogo_dev>
+      payload_s3_url: s3://<bucket>/payloads/
+      endpoint_name: large-payload-scoring-dev
+      enable_scale_to_zero: "true"  # economia em dev; aqueça o endpoint antes de medir latência
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    # Em produção, implante por CI com um service principal (run_as) e não com usuário pessoal.
+    variables:
+      catalog: <catalogo_prod>
+      payload_s3_url: s3://<bucket>/payloads/
