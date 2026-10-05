@@ -48,14 +48,13 @@ Do início do upload, pela Lambda, até a decisão chegar pelo SNS:
 
 | Payload | Upload S3 | POST → 202 | Model Serving lê + pontua | Total |
 |---|---|---|---|---|
-| 15 MB | 0,23 s | 0,19 s | 1,8 s | 4,8 s ¹ |
-| 22 MB | 0,33 s | 0,12 s | 1,3 s | 2,9 s |
-| **29 MB** | 0,43 s | 0,12 s | **1,2 s** | **2,9 s** |
-| 32 MB | 0,44 s | 0,12 s | 1,5 s | 3,5 s |
+| 15 MB | 0,25 s | 0,15 s | 0,8 s | 2,7 s |
+| 22 MB | 0,28 s | 0,12 s | 1,2 s | 2,6 s |
+| **29 MB** | 0,37 s | 0,17 s | **1,2 s** | **2,6 s** |
+| 32 MB | 0,39 s | 0,12 s | 1,0 s | 2,6 s |
 
-¹ primeira chamada, com cold start da Lambda. O JSON de teste é sintético, mas realista (~180 mil
-registros de histórico em 29 MB). Com scale-to-zero, o endpoint leva minutos para subir: em
-produção, deixe desligado.
+O JSON de teste é sintético, mas realista (~180 mil registros de histórico em 29 MB). Com
+scale-to-zero, o endpoint leva minutos para subir: em produção, deixe desligado.
 
 ## Estrutura
 
